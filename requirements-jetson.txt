@@ -1,0 +1,5 @@
+# Jetson note:
+# Install JetPack-matched torch and torchvision from NVIDIA first.
+# Do not use requirements-gpu-cu130.txt on Jetson; that file is for x86 laptop/desktop CUDA.
+ultralytics>=8.0.0
+PyYAML>=6.0

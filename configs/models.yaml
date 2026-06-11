@@ -1,0 +1,23 @@
+person_class_id: 0
+
+models:
+  fast:
+    name: YOLOv8n - fast
+    weights: yolov8n.pt
+    imgsz: 640
+    conf: 0.25
+    description: Fastest option for webcam or weak CPU/GPU.
+
+  balanced:
+    name: YOLOv8s - balanced
+    weights: yolov8s.pt
+    imgsz: 640
+    conf: 0.25
+    description: Good balance between speed and accuracy.
+
+  accurate:
+    name: YOLOv8m - accurate
+    weights: yolov8m.pt
+    imgsz: 768
+    conf: 0.25
+    description: More accurate for crowded or distant people, slower than the others.
