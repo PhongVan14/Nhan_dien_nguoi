@@ -31,6 +31,18 @@ def parse_args():
     parser.add_argument("--track-distance", type=float, default=120.0)
     parser.add_argument("--max-missing", type=int, default=30)
     parser.add_argument(
+        "--min-track-hits",
+        type=int,
+        default=2,
+        help="Count a new person only after the track is detected this many times.",
+    )
+    parser.add_argument(
+        "--max-match-cost",
+        type=float,
+        default=0.85,
+        help="Maximum DeepSORT-style matching cost. Lower is stricter.",
+    )
+    parser.add_argument(
         "--class-id",
         type=int,
         default=0,
@@ -180,43 +192,97 @@ class TensorRTRunner:
         self.device_buffers = {}
 
 
-class CentroidTracker:
-    def __init__(self, max_distance=120.0, max_missing=30):
+def box_center(box):
+    x, y, w, h = box
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def box_iou(box_a, box_b):
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    ax2 = ax + aw
+    ay2 = ay + ah
+    bx2 = bx + bw
+    by2 = by + bh
+
+    inter_x1 = max(ax, bx)
+    inter_y1 = max(ay, by)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    union_area = aw * ah + bw * bh - inter_area
+    if union_area <= 0:
+        return 0.0
+    return float(inter_area) / float(union_area)
+
+
+def extract_appearance(frame, box):
+    x, y, w, h = box
+    height, width = frame.shape[:2]
+    x1 = max(0, min(width - 1, int(x)))
+    y1 = max(0, min(height - 1, int(y)))
+    x2 = max(0, min(width, int(x + w)))
+    y2 = max(0, min(height, int(y + h)))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros((256,), dtype=np.float32)
+
+    crop = frame[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    feature = hist.reshape(-1).astype(np.float32)
+    norm = np.linalg.norm(feature)
+    if norm > 0:
+        feature = feature / norm
+    return feature
+
+
+def appearance_similarity(feature_a, feature_b):
+    if feature_a is None or feature_b is None:
+        return 0.0
+    similarity = float(np.dot(feature_a, feature_b))
+    return max(0.0, min(1.0, similarity))
+
+
+class DeepSortLiteTracker:
+    def __init__(self, max_distance=120.0, max_missing=30, min_hits=2, max_cost=0.85):
         self.max_distance = max_distance
         self.max_missing = max_missing
+        self.min_hits = max(1, min_hits)
+        self.max_cost = max_cost
         self.next_id = 1
         self.tracks = {}
         self.total_seen = 0
 
-    def update(self, detections):
+    def update(self, frame, detections):
         prepared = []
         for box, score in detections:
-            x, y, w, h = box
-            center = (x + w / 2.0, y + h / 2.0)
-            prepared.append((center, box, score))
+            center = box_center(box)
+            feature = extract_appearance(frame, box)
+            prepared.append(
+                {
+                    "center": center,
+                    "box": box,
+                    "score": score,
+                    "feature": feature,
+                }
+            )
 
         unmatched_detections = set(range(len(prepared)))
         unmatched_tracks = set(self.tracks.keys())
         pairs = []
         for track_id, track in self.tracks.items():
-            tx, ty = track["center"]
-            for det_index, (center, _, _) in enumerate(prepared):
-                dx = tx - center[0]
-                dy = ty - center[1]
-                pairs.append((dx * dx + dy * dy, track_id, det_index))
+            predicted = self._predict_center(track)
+            for det_index, detection in enumerate(prepared):
+                cost = self._match_cost(track, predicted, detection)
+                if cost <= self.max_cost:
+                    pairs.append((cost, track_id, det_index))
 
-        for distance_sq, track_id, det_index in sorted(pairs):
+        for cost, track_id, det_index in sorted(pairs):
             if track_id not in unmatched_tracks or det_index not in unmatched_detections:
                 continue
-            if distance_sq > self.max_distance * self.max_distance:
-                continue
-            center, box, score = prepared[det_index]
-            self.tracks[track_id] = {
-                "center": center,
-                "box": box,
-                "score": score,
-                "missing": 0,
-            }
+            self._update_track(track_id, prepared[det_index])
             unmatched_tracks.remove(track_id)
             unmatched_detections.remove(det_index)
 
@@ -227,14 +293,7 @@ class CentroidTracker:
                 del self.tracks[track_id]
 
         for det_index in sorted(unmatched_detections):
-            center, box, score = prepared[det_index]
-            self.tracks[self.next_id] = {
-                "center": center,
-                "box": box,
-                "score": score,
-                "missing": 0,
-            }
-            self.total_seen += 1
+            self._new_track(prepared[det_index])
             self.next_id += 1
 
         active = []
@@ -242,6 +301,68 @@ class CentroidTracker:
             if track["missing"] == 0:
                 active.append((track_id, track["box"], track["score"]))
         return active
+
+    def _predict_center(self, track):
+        center = track["center"]
+        velocity = track["velocity"]
+        return (center[0] + velocity[0], center[1] + velocity[1])
+
+    def _match_cost(self, track, predicted_center, detection):
+        detection_center = detection["center"]
+        dx = predicted_center[0] - detection_center[0]
+        dy = predicted_center[1] - detection_center[1]
+        distance = (dx * dx + dy * dy) ** 0.5
+        iou = box_iou(track["box"], detection["box"])
+        appearance = appearance_similarity(track["feature"], detection["feature"])
+
+        if distance > self.max_distance and iou < 0.05 and appearance < 0.65:
+            return 999.0
+
+        motion_cost = min(distance / max(1.0, self.max_distance), 1.5)
+        iou_cost = 1.0 - iou
+        appearance_cost = 1.0 - appearance
+        return 0.35 * motion_cost + 0.35 * iou_cost + 0.30 * appearance_cost
+
+    def _update_track(self, track_id, detection):
+        track = self.tracks[track_id]
+        old_center = track["center"]
+        new_center = detection["center"]
+        old_velocity = track["velocity"]
+        measured_velocity = (
+            new_center[0] - old_center[0],
+            new_center[1] - old_center[1],
+        )
+        track["velocity"] = (
+            0.6 * old_velocity[0] + 0.4 * measured_velocity[0],
+            0.6 * old_velocity[1] + 0.4 * measured_velocity[1],
+        )
+        track["center"] = new_center
+        track["box"] = detection["box"]
+        track["score"] = detection["score"]
+        track["feature"] = 0.8 * track["feature"] + 0.2 * detection["feature"]
+        norm = np.linalg.norm(track["feature"])
+        if norm > 0:
+            track["feature"] = track["feature"] / norm
+        track["missing"] = 0
+        track["hits"] += 1
+        if not track["counted"] and track["hits"] >= self.min_hits:
+            track["counted"] = True
+            self.total_seen += 1
+
+    def _new_track(self, detection):
+        counted = self.min_hits <= 1
+        self.tracks[self.next_id] = {
+            "center": detection["center"],
+            "velocity": (0.0, 0.0),
+            "box": detection["box"],
+            "score": detection["score"],
+            "feature": detection["feature"],
+            "missing": 0,
+            "hits": 1,
+            "counted": counted,
+        }
+        if counted:
+            self.total_seen += 1
 
 
 def letterbox(frame, imgsz):
@@ -373,7 +494,12 @@ def main():
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
     writer = make_writer(args.output, fps, width, height)
-    tracker = CentroidTracker(args.track_distance, args.max_missing)
+    tracker = DeepSortLiteTracker(
+        args.track_distance,
+        args.max_missing,
+        args.min_track_hits,
+        args.max_match_cost,
+    )
 
     frame_index = 0
     people_count = 0
@@ -389,7 +515,7 @@ def main():
                 runner, frame, args.imgsz, args.conf, args.iou, args.class_id
             )
             if args.count_mode == "seen":
-                tracks = tracker.update(detections)
+                tracks = tracker.update(frame, detections)
                 people_count = tracker.total_seen
                 draw_tracks(frame, tracks)
             else:
