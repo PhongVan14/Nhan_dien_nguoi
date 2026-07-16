@@ -21,12 +21,27 @@ def parse_args():
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument(
         "--count-mode",
-        choices=["seen", "frame", "max"],
-        default="seen",
+        choices=["line", "seen", "frame", "max"],
+        default="line",
         help=(
+            "line counts left-to-right crossings as IN and right-to-left as OUT, "
             "seen counts each new tracked person once, frame counts current detections, "
             "max shows the largest current-frame count seen so far."
         ),
+    )
+    parser.add_argument(
+        "--line-x",
+        type=float,
+        help=(
+            "Vertical counting line x position. Use pixels, or 0-1 as a frame-width ratio. "
+            "Default is the center of the frame."
+        ),
+    )
+    parser.add_argument(
+        "--line-cooldown",
+        type=int,
+        default=12,
+        help="Minimum frames before the same track can be counted again.",
     )
     parser.add_argument("--track-distance", type=float, default=120.0)
     parser.add_argument("--max-missing", type=int, default=30)
@@ -365,6 +380,70 @@ class DeepSortLiteTracker:
             self.total_seen += 1
 
 
+class LeftRightLineCounter:
+    def __init__(self, line_x, cooldown_frames=12, max_missing_frames=90):
+        self.line_x = float(line_x)
+        self.cooldown_frames = cooldown_frames
+        self.max_missing_frames = max_missing_frames
+        self.in_count = 0
+        self.out_count = 0
+        self.states = {}
+
+    @property
+    def total(self):
+        return self.in_count + self.out_count
+
+    def update(self, tracks, frame_index):
+        events = []
+        for track_id, box, _score in tracks:
+            center_x, _center_y = box_center(box)
+            side = self._side(center_x)
+            if side == 0:
+                continue
+
+            state = self.states.setdefault(
+                track_id,
+                {"side": 0, "last_frame": frame_index, "last_count_frame": -100000},
+            )
+            state["last_frame"] = frame_index
+
+            previous_side = state["side"]
+            if previous_side == 0:
+                state["side"] = side
+                continue
+
+            if previous_side != side:
+                if frame_index - state["last_count_frame"] >= self.cooldown_frames:
+                    if previous_side < side:
+                        self.in_count += 1
+                        direction = "in"
+                    else:
+                        self.out_count += 1
+                        direction = "out"
+                    state["last_count_frame"] = frame_index
+                    events.append((track_id, direction))
+                state["side"] = side
+
+        self._drop_missing_tracks(frame_index)
+        return events
+
+    def _side(self, center_x):
+        if center_x < self.line_x:
+            return -1
+        if center_x > self.line_x:
+            return 1
+        return 0
+
+    def _drop_missing_tracks(self, frame_index):
+        stale_ids = [
+            track_id
+            for track_id, state in self.states.items()
+            if frame_index - state["last_frame"] > self.max_missing_frames
+        ]
+        for track_id in stale_ids:
+            del self.states[track_id]
+
+
 def letterbox(frame, imgsz):
     height, width = frame.shape[:2]
     scale = min(float(imgsz) / float(width), float(imgsz) / float(height))
@@ -457,6 +536,20 @@ def draw_people_count(frame, people_count):
     draw_text(frame, "PEOPLE: {}".format(people_count), (20, 36))
 
 
+def draw_line_counts(frame, counter):
+    draw_text(frame, "IN: {}".format(counter.in_count), (20, 36))
+    draw_text(frame, "OUT: {}".format(counter.out_count), (20, 66))
+    draw_text(frame, "TOTAL: {}".format(counter.total), (20, 96))
+
+
+def draw_counting_line(frame, line_x):
+    height, width = frame.shape[:2]
+    x = max(0, min(width - 1, int(round(line_x))))
+    cv2.line(frame, (x, 0), (x, height - 1), (0, 255, 255), 2)
+    draw_text(frame, "OUT", (max(20, x - 70), 130), bg=(55, 55, 15))
+    draw_text(frame, "IN", (min(width - 60, x + 20), 130), bg=(15, 55, 55))
+
+
 def draw_detections(frame, detections):
     for box, score in detections:
         x, y, w, h = box
@@ -467,7 +560,9 @@ def draw_detections(frame, detections):
 def draw_tracks(frame, tracks):
     for track_id, box, score in tracks:
         x, y, w, h = box
+        center_x, center_y = box_center(box)
         cv2.rectangle(frame, (x, y), (x + w, y + h), (22, 163, 74), 2)
+        cv2.circle(frame, (int(center_x), int(center_y)), 4, (0, 255, 255), -1)
         draw_text(
             frame,
             "person #{} {:.2f}".format(track_id, score),
@@ -479,8 +574,25 @@ def make_writer(output_path, fps, width, height):
     if output_path is None:
         return None
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    return cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    suffix = output_path.suffix.lower()
+    codec = "MJPG" if suffix == ".avi" else "mp4v"
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(
+            "Cannot open output writer: {} ({}x{}, {:.2f} fps, codec {})".format(
+                output_path, width, height, fps, codec
+            )
+        )
+    return writer
+
+
+def resolve_line_x(value, frame_width):
+    if value is None:
+        return frame_width / 2.0
+    if 0.0 < value < 1.0:
+        return frame_width * value
+    return value
 
 
 def main():
@@ -490,16 +602,15 @@ def main():
     if not capture.isOpened():
         raise SystemExit("Cannot open source: {}".format(args.source))
 
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
-    writer = make_writer(args.output, fps, width, height)
+    writer = None
     tracker = DeepSortLiteTracker(
         args.track_distance,
         args.max_missing,
         args.min_track_hits,
         args.max_match_cost,
     )
+    line_counter = None
 
     frame_index = 0
     people_count = 0
@@ -511,13 +622,31 @@ def main():
             if not ok:
                 break
             frame_index += 1
+            if writer is None and args.output is not None:
+                frame_height, frame_width = frame.shape[:2]
+                writer = make_writer(args.output, fps, frame_width, frame_height)
+            if args.count_mode == "line" and line_counter is None:
+                frame_width = frame.shape[1]
+                line_counter = LeftRightLineCounter(
+                    resolve_line_x(args.line_x, frame_width),
+                    cooldown_frames=args.line_cooldown,
+                    max_missing_frames=args.max_missing,
+                )
             detections = detect_people(
                 runner, frame, args.imgsz, args.conf, args.iou, args.class_id
             )
-            if args.count_mode == "seen":
+            if args.count_mode == "line":
+                tracks = tracker.update(frame, detections)
+                line_counter.update(tracks, frame_index)
+                people_count = line_counter.total
+                draw_tracks(frame, tracks)
+                draw_counting_line(frame, line_counter.line_x)
+                draw_line_counts(frame, line_counter)
+            elif args.count_mode == "seen":
                 tracks = tracker.update(frame, detections)
                 people_count = tracker.total_seen
                 draw_tracks(frame, tracks)
+                draw_people_count(frame, people_count)
             else:
                 current_count = len(detections)
                 max_people_count = max(max_people_count, current_count)
@@ -525,8 +654,8 @@ def main():
                     max_people_count if args.count_mode == "max" else current_count
                 )
                 draw_detections(frame, detections)
+                draw_people_count(frame, people_count)
 
-            draw_people_count(frame, people_count)
             if writer is not None:
                 writer.write(frame)
             if args.show:
@@ -544,7 +673,17 @@ def main():
     elapsed = time.time() - started_at
     print("Frames: {}".format(frame_index))
     print("Time: {:.1f}s".format(elapsed))
-    print("PEOPLE: {}".format(people_count))
+    if args.count_mode == "line":
+        if line_counter is None:
+            print("IN: 0")
+            print("OUT: 0")
+            print("TOTAL: 0")
+        else:
+            print("IN: {}".format(line_counter.in_count))
+            print("OUT: {}".format(line_counter.out_count))
+            print("TOTAL: {}".format(line_counter.total))
+    else:
+        print("PEOPLE: {}".format(people_count))
     if args.output:
         print("Saved: {}".format(args.output))
 

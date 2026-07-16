@@ -3,9 +3,13 @@ __pycache__/
 *.pt
 .venv/
 venv/
+.vscode/
+debug.log
 
 runs/
 outputs/
+videos/
+dataset_ship/
 dataset/archive.zip
 dataset/images/
 dataset/labels/
